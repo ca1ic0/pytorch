@@ -2244,13 +2244,48 @@ class BenchmarkRunner:
         if self.args.print_compilation_time:
             print(f"Compilation time (from dynamo_timed): {total_wall_time}")
 
+    def _collect_fp64_golden_outputs(self, name, model, example_inputs):
+        """
+        Collect fp64 golden-reference outputs for accuracy checking.
+
+        Returns None when the fp64 run fails; the caller should fall back
+        to cosine-similarity comparison in that case.
+        """
+        model_fp64 = None
+        inputs_fp64 = None
+        try:
+            model_fp64, inputs_fp64 = cast_to_fp64(
+                self.deepcopy_and_maybe_parallelize(model),
+                clone_inputs(example_inputs),
+            )
+            self.init_optimizer(name, current_device, model_fp64.parameters())
+            fp64_outputs = self.run_n_iterations(
+                model_fp64, inputs_fp64, self.model_iter_fn
+            )
+            return tree_map(
+                lambda x: x.to(torch.float64)
+                if isinstance(x, torch.Tensor) and x.is_floating_point()
+                else x,
+                fp64_outputs,
+            )
+        except Exception:
+            log.warning(
+                "fp64 golden ref were not generated for %s. Setting accuracy check to cosine",
+                name,
+                exc_info=True,
+            )
+            return None
+        finally:
+            del model_fp64, inputs_fp64
+            empty_gpu_cache(current_device)
+
     def check_accuracy(
         self, name, model, example_inputs, optimize_ctx, experiment, tag
     ):
         """
         Checks accuracy.
-        1) Collect the outputs with fp64 datatype. This is useful for error checking.
-        2) Checks if eager itself has variations.
+        1) Checks if eager itself has variations.
+        2) Collect the outputs with fp64 datatype. This is useful for error checking.
         """
         start_stats = get_dynamo_stats()
 
@@ -2277,40 +2312,28 @@ class BenchmarkRunner:
             return record_status("pass_due_to_skip", dynamo_start_stats=start_stats)
 
         with self.pick_grad(name, self.args.training):
-            # Collect the fp64 reference outputs to be used later for accuracy checking.
+            # --float16/--bfloat16 cast the model weights in place (see
+            # maybe_cast below), so in those modes the fp64 golden reference
+            # must be collected from the pristine model, before casting.
+            # In all other modes defer the fp64 phase until after the eager
+            # runs: a failing or flaky eager phase then skips the (expensive)
+            # fp64 phase entirely, and the fp64 outputs never share device
+            # memory with the eager-phase outputs.
+            defer_fp64 = not (self.args.float16 or self.args.bfloat16)
+
             fp64_outputs = None
-            model_fp64 = None
-            inputs_fp64 = None
-            try:
-                model_fp64, inputs_fp64 = cast_to_fp64(
-                    self.deepcopy_and_maybe_parallelize(model),
-                    clone_inputs(example_inputs),
+            fp64_failed = False
+            if not defer_fp64:
+                fp64_outputs = self._collect_fp64_golden_outputs(
+                    name, model, example_inputs
                 )
-                self.init_optimizer(name, current_device, model_fp64.parameters())
-                fp64_outputs = self.run_n_iterations(
-                    model_fp64, inputs_fp64, self.model_iter_fn
-                )
-                fp64_outputs = tree_map(
-                    lambda x: x.to(torch.float64)
-                    if isinstance(x, torch.Tensor) and x.is_floating_point()
-                    else x,
-                    fp64_outputs,
-                )
-            except Exception:
-                log.warning(
-                    "fp64 golden ref were not generated for %s. Setting accuracy check to cosine",
-                    name,
-                    exc_info=True,
-                )
-                self.args.cosine = True
-                fp64_outputs = None
-            finally:
-                del model_fp64, inputs_fp64
-                empty_gpu_cache(current_device)
+                fp64_failed = fp64_outputs is None
 
             tolerance, cos_similarity = self.get_tolerance_and_cosine_flag(
                 self.args.training, current_device, name
             )
+            if fp64_failed:
+                cos_similarity = True
 
             # Cast the model to float16/float32 as necessary
             model, example_inputs = self.maybe_cast(model, example_inputs)
@@ -2389,6 +2412,16 @@ class BenchmarkRunner:
                 return record_status(accuracy_status, dynamo_start_stats=start_stats)
 
             correct_rerun_result = None
+
+            if defer_fp64:
+                # Eager phases passed; collect the fp64 golden reference
+                # outputs now, so they only coexist with correct_result
+                # instead of with both eager-phase outputs.
+                fp64_outputs = self._collect_fp64_golden_outputs(
+                    name, model, example_inputs
+                )
+                if fp64_outputs is None:
+                    cos_similarity = True
 
             # Support multiple accuracy check runs for flaky models
             accuracy_check_runs = self.get_accuracy_check_runs(name)
