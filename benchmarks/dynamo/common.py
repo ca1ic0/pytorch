@@ -1745,6 +1745,18 @@ def cast_to_fp32(model, inputs):
     return cast_to(torch.float32, model, inputs)
 
 
+def move_to_cpu(outputs):
+    """
+    Detach an output tree and move its tensors to host memory, so that
+    accuracy-check outputs do not stay resident on the benchmark device.
+    """
+    return tree_map_only(
+        torch.Tensor,
+        lambda x: x.detach().cpu() if x.device.type != "cpu" else x.detach(),
+        outputs,
+    )
+
+
 class DummyGradScaler:
     def scale(self, loss):
         return loss
@@ -2296,6 +2308,8 @@ class BenchmarkRunner:
                     else x,
                     fp64_outputs,
                 )
+                if self.args.verify_on_cpu:
+                    fp64_outputs = move_to_cpu(fp64_outputs)
             except Exception:
                 log.warning(
                     "fp64 golden ref were not generated for %s. Setting accuracy check to cosine",
@@ -2326,6 +2340,8 @@ class BenchmarkRunner:
                     correct_result = self.run_n_iterations(
                         model_copy, clone_inputs(example_inputs), self.model_iter_fn
                     )
+                    if self.args.verify_on_cpu:
+                        correct_result = move_to_cpu(correct_result)
             except Exception as e:
                 accuracy_status = (
                     "eager_1st_run_OOM"
@@ -2348,6 +2364,8 @@ class BenchmarkRunner:
                     correct_rerun_result = self.run_n_iterations(
                         model_copy, clone_inputs(example_inputs), self.model_iter_fn
                     )
+                    if self.args.verify_on_cpu:
+                        correct_rerun_result = move_to_cpu(correct_rerun_result)
             except Exception as e:
                 accuracy_status = (
                     "eager_2nd_run_OOM"
@@ -2504,6 +2522,13 @@ class BenchmarkRunner:
                             "The result is bitwise equivalent to the previously saved result"
                         )
                         del saved_result
+
+                    if self.args.verify_on_cpu:
+                        # Compared on host below; the device copy is dropped
+                        # here so eager/compiled/fp64 outputs are never all
+                        # resident on the device at once.
+                        new_result = move_to_cpu(new_result)
+                        empty_gpu_cache(current_device)
 
                     if not same(
                         correct_result,
@@ -3421,6 +3446,14 @@ def parse_args(args=None):
     )
     parser.add_argument(
         "--skip-fp64-check", action="store_true", help="skip accuracy check using fp64"
+    )
+    parser.add_argument(
+        "--verify-on-cpu",
+        action="store_true",
+        help="Move accuracy-check outputs to host memory right after each run "
+        "and run the same() comparison on CPU. Trades D2H copy time for "
+        "device memory: eager, compiled and fp64 outputs are never all "
+        "resident on the device at once.",
     )
     parser.add_argument(
         "--fast", "-f", action="store_true", help="skip slow benchmarks"
