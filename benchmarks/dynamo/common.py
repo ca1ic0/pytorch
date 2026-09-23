@@ -2388,7 +2388,11 @@ class BenchmarkRunner:
                 accuracy_status = "eager_two_runs_differ"
                 return record_status(accuracy_status, dynamo_start_stats=start_stats)
 
-            correct_rerun_result = None
+            # The eager rerun result is only needed for the flakiness check
+            # above. Release it (and its allocator blocks) before the fp64 and
+            # dynamo phases so it does not stay co-resident with them.
+            del correct_rerun_result
+            empty_gpu_cache(current_device)
 
             # Support multiple accuracy check runs for flaky models
             accuracy_check_runs = self.get_accuracy_check_runs(name)
@@ -2534,6 +2538,12 @@ class BenchmarkRunner:
                         accuracy_check_runs,
                         "passed" if run_passed else "failed",
                     )
+
+                # Release this run's outputs (and the same() comparison
+                # temporaries held by the caching allocator) before the next
+                # accuracy run starts.
+                del new_result
+                empty_gpu_cache(current_device)
 
             # Pass if majority of runs pass (more than half)
             is_same = pass_count > accuracy_check_runs // 2
