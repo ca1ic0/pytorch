@@ -2306,6 +2306,7 @@ class BenchmarkRunner:
                 fp64_outputs = None
             finally:
                 del model_fp64, inputs_fp64
+                gc.collect()
                 empty_gpu_cache(current_device)
 
             tolerance, cos_similarity = self.get_tolerance_and_cosine_flag(
@@ -2336,6 +2337,7 @@ class BenchmarkRunner:
                 return record_status(accuracy_status, dynamo_start_stats=start_stats)
             finally:
                 del model_copy
+                gc.collect()
                 empty_gpu_cache(current_device)
 
             # Rerun native pytorch
@@ -2358,6 +2360,7 @@ class BenchmarkRunner:
                 return record_status(accuracy_status, dynamo_start_stats=start_stats)
             finally:
                 del model_copy
+                gc.collect()
                 empty_gpu_cache(current_device)
 
             # Two eager runs should have exactly same result, within tolerance.
@@ -2399,6 +2402,11 @@ class BenchmarkRunner:
                 reset_rng_state()
                 torch._dynamo.reset()
                 torch._dynamo.utils.counters.clear()
+                # Eager -> compiled phase boundary: drop cyclic garbage from
+                # the previous phase and return its blocks to the device
+                # before compilation starts allocating.
+                gc.collect()
+                empty_gpu_cache(current_device)
                 model_copy = None
                 run_passed = True
 
@@ -2441,7 +2449,13 @@ class BenchmarkRunner:
                         accuracy_status, dynamo_start_stats=start_stats
                     )
                 finally:
+                    # The compiled model copy often sits in reference cycles
+                    # (dynamo guards/closures); gc.collect() is needed for the
+                    # del to actually release device memory before the
+                    # comparison phase.
                     del model_copy
+                    gc.collect()
+                    empty_gpu_cache(current_device)
 
                 if name in self.skip_accuracy_check_as_eager_non_deterministic:
                     return record_status(
