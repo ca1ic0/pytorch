@@ -3527,6 +3527,8 @@ instantiate_device_type_tests(
 class TestPrivateUse1ProfilerState(TestCase):
     """Tests for PrivateUse1 profiler state selection logic."""
 
+    hw_classification = HardwareClassification.GENERIC
+
     def test_kineto_privateuse1_state_with_use_kineto_true(self):
         """Test that KINETO_PRIVATEUSE1 state is selected when use_kineto=True."""
         from unittest.mock import patch
@@ -3580,8 +3582,6 @@ class TestPrivateUse1ProfilerState(TestCase):
                 )
 
 
-@instantiate_parametrized_tests
-@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestProfilerDeviceStopped(TestCase):
     """Tests for the DEVICE_STOPPED transition: when Kineto signals that
     device collection has stopped (e.g. CUPTI buffer overflow), the profiler
@@ -3589,20 +3589,24 @@ class TestProfilerDeviceStopped(TestCase):
     cycle, and resumes normal scheduling on the next cycle. The Kineto signal
     is mocked so no actual overflow is needed.
 
-    Note that we don't actually depend on any CUDA specific behavior. But the
-    DEVICE_STOPPED logic does behave different if the user has only requested
-    CPU-only profiling. Explicitly specifying a GPU device seems cleaner than
-    patching the `use_device` attributes in the profiler."""
+    Note that we don't actually depend on any accelerator-specific behavior.
+    But the DEVICE_STOPPED logic does behave different if the user has only
+    requested CPU-only profiling. Explicitly specifying a GPU device seems
+    cleaner than patching the `use_device` attributes in the profiler."""
 
+    hw_classification = HardwareClassification.ACCELERATOR
     PATCH_TARGET = "torch.autograd._is_kineto_stopped"
+
+    def _device_activities(self):
+        return get_profiler_activities(self.device_type)
 
     def _make_profiler(self, **schedule_kwargs):
         return profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=self._device_activities(),
             schedule=torch.profiler.schedule(**schedule_kwargs),
         )
 
-    def test_enters_device_stopped_from_warmup(self):
+    def test_enters_device_stopped_from_warmup(self, device):
         p = self._make_profiler(wait=0, warmup=2, active=2)
         with patch(self.PATCH_TARGET, return_value=True):
             p.start()
@@ -3612,7 +3616,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.DEVICE_STOPPED)
             p.stop()
 
-    def test_enters_device_stopped_from_record(self):
+    def test_enters_device_stopped_from_record(self, device):
         p = self._make_profiler(wait=0, warmup=1, active=3)
         with patch(self.PATCH_TARGET, return_value=False):
             p.start()
@@ -3627,7 +3631,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.DEVICE_STOPPED)
             p.stop()
 
-    def test_does_not_enter_device_stopped_from_record_and_save(self):
+    def test_does_not_enter_device_stopped_from_record_and_save(self, device):
         """When prev_action is RECORD_AND_SAVE, the natural action_map
         transition (e.g. R&S -> WARMUP) already fires stop_trace +
         _trace_ready + prepare_trace, which resets Kineto. We do NOT
@@ -3641,7 +3645,7 @@ class TestProfilerDeviceStopped(TestCase):
             callback_count[0] += 1
 
         p = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=self._device_activities(),
             schedule=torch.profiler.schedule(wait=0, warmup=1, active=2, repeat=2),
             on_trace_ready=handler,
         )
@@ -3677,7 +3681,7 @@ class TestProfilerDeviceStopped(TestCase):
             # cycle 2 R&S -> stop fires on_trace_ready a second time
             self.assertEqual(callback_count[0], 2)
 
-    def test_device_stopped_persists_through_cycle(self):
+    def test_device_stopped_persists_through_cycle(self, device):
         """Once in DEVICE_STOPPED, the profiler stays there until the schedule
         moves to WARMUP (new cycle) or NONE (end)."""
         p = self._make_profiler(wait=0, warmup=1, active=4, repeat=2)
@@ -3703,7 +3707,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.WARMUP)
             p.stop()
 
-    def test_device_stopped_recovers_without_warmup(self):
+    def test_device_stopped_recovers_without_warmup(self, device):
         """With warmup=0 (and wait=0), the schedule never produces WARMUP or
         NONE between cycles. DEVICE_STOPPED must still exit at cycle
         boundaries (RECORD_AND_SAVE -> next), otherwise the profiler would
@@ -3732,7 +3736,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.RECORD)
             p.stop()
 
-    def test_device_stopped_exits_via_wait_phase(self):
+    def test_device_stopped_exits_via_wait_phase(self, device):
         """With wait > 0, the NONE phase between cycles is the natural
         exit path out of DEVICE_STOPPED. After the wait, profiling resumes
         normally through WARMUP and RECORD."""
@@ -3777,7 +3781,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.RECORD)
             p.stop()
 
-    def test_device_stopped_persists_through_multistep_warmup(self):
+    def test_device_stopped_persists_through_multistep_warmup(self, device):
         """With warmup >= 2, consecutive WARMUP steps are mid-cycle, not
         cycle boundaries. DEVICE_STOPPED must persist through the entire
         warmup phase rather than oscillating WARMUP -> DEVICE_STOPPED ->
@@ -3812,7 +3816,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.NONE)
             p.stop()
 
-    def test_warmup_to_device_stopped_fires_trace_ready(self):
+    def test_warmup_to_device_stopped_fires_trace_ready(self, device):
         """When DEVICE_STOPPED is entered from WARMUP (e.g. active=1
         schedule where every R&S step gets converted to DS), the
         (WARMUP, DEVICE_STOPPED) transition must fire on_trace_ready so
@@ -3829,7 +3833,7 @@ class TestProfilerDeviceStopped(TestCase):
         # on every step the entry guard converts each cycle's R&S to DS via
         # (W, DS), and DS exits at cycle boundary via (DS, W).
         p = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=self._device_activities(),
             schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=3),
             on_trace_ready=handler,
         )
@@ -3852,7 +3856,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(callback_count[0], 2)
             p.stop()
 
-    def test_start_after_stop_in_device_stopped(self):
+    def test_start_after_stop_in_device_stopped(self, device):
         """A user may call start() after a stop() that left current_action
         in DEVICE_STOPPED. The second start() must re-derive state from
         the schedule (not trust the stale DS), so a real (NONE, X)
@@ -3863,7 +3867,7 @@ class TestProfilerDeviceStopped(TestCase):
             callback_count[0] += 1
 
         p = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=self._device_activities(),
             schedule=torch.profiler.schedule(wait=0, warmup=1, active=1),
             on_trace_ready=handler,
         )
@@ -3893,18 +3897,18 @@ class TestProfilerDeviceStopped(TestCase):
             "second run must produce a trace, not silently no-op",
         )
 
-    def test_user_schedule_returning_device_stopped_raises_at_init(self):
+    def test_user_schedule_returning_device_stopped_raises_at_init(self, device):
         """ProfilerAction.DEVICE_STOPPED is internal; user-provided
         schedules must not return it. __init__ catches schedules that
         return it at step 0 — without this check, start() would silently
         no-op the (NONE, DS) transition and leave the profiler dead."""
         with self.assertRaisesRegex(ValueError, "DEVICE_STOPPED is set internally"):
             profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                activities=self._device_activities(),
                 schedule=lambda step: ProfilerAction.DEVICE_STOPPED,
             )
 
-    def test_user_schedule_returning_device_stopped_raises_at_step(self):
+    def test_user_schedule_returning_device_stopped_raises_at_step(self, device):
         """If the user schedule returns DEVICE_STOPPED on a later step,
         step() raises ValueError and leaves the profiler state untouched
         so the user can stop() cleanly after catching the error."""
@@ -3915,7 +3919,7 @@ class TestProfilerDeviceStopped(TestCase):
             return ProfilerAction.DEVICE_STOPPED
 
         p = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=self._device_activities(),
             schedule=bad_schedule,
         )
         p.start()
@@ -3932,7 +3936,7 @@ class TestProfilerDeviceStopped(TestCase):
         # stop() runs without re-exiting an already-exited record_function.
         p.stop()
 
-    def test_device_stopped_recovers_across_infinite_cycles(self):
+    def test_device_stopped_recovers_across_infinite_cycles(self, device):
         """With repeat=0 (infinite cycles), DEVICE_STOPPED entry and
         recovery must work across multiple cycles, not just one."""
         # Normal schedule for wait=0, warmup=1, active=2, repeat=0 (cycle length 3, infinite):
@@ -3976,7 +3980,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.WARMUP)
             p.stop()
 
-    def test_skips_device_stopped_when_prev_is_none(self):
+    def test_skips_device_stopped_when_prev_is_none(self, device):
         p = self._make_profiler(wait=2, warmup=1, active=1)
         with patch(self.PATCH_TARGET, return_value=True):
             p.start()
@@ -3987,7 +3991,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.NONE)
             p.stop()
 
-    def test_skips_device_stopped_when_already_stopping(self):
+    def test_skips_device_stopped_when_already_stopping(self, device):
         p = self._make_profiler(wait=0, warmup=1, active=1, repeat=1)
         with patch(self.PATCH_TARGET, return_value=False):
             p.start()
@@ -4007,7 +4011,7 @@ class TestProfilerDeviceStopped(TestCase):
         "prev",
         [ProfilerAction.NONE, ProfilerAction.RECORD_AND_SAVE],
     )
-    def test_unreachable_transition_raises(self, prev):
+    def test_unreachable_transition_raises(self, device, prev):
         """Transitions into DEVICE_STOPPED that step() / start() / __init__
         all exclude should raise if invoked directly via _transit_action.
 
@@ -4024,7 +4028,7 @@ class TestProfilerDeviceStopped(TestCase):
         ):
             p._transit_action(prev, ProfilerAction.DEVICE_STOPPED)
 
-    def test_cpu_only_profiler_ignores_stale_is_kineto_stopped(self):
+    def test_cpu_only_profiler_ignores_stale_is_kineto_stopped(self, device):
         """A CPU-only profiler should not enter DEVICE_STOPPED even if
         _is_kineto_stopped returns True (e.g. stale flag from a previous
         device profiler)."""
@@ -4040,7 +4044,7 @@ class TestProfilerDeviceStopped(TestCase):
             self.assertEqual(p.current_action, ProfilerAction.RECORD_AND_SAVE)
             p.stop()
 
-    def test_device_stopped_with_real_kineto(self):
+    def test_device_stopped_with_real_kineto(self, device):
         """Integration test: when _is_kineto_stopped flips True mid-run
         against a live Kineto session, the DEVICE_STOPPED transition must
         actually fire stop_trace + _trace_ready (not just flip the action
@@ -4052,7 +4056,7 @@ class TestProfilerDeviceStopped(TestCase):
             event_counts.append(len(list(prof.events())))
 
         p = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=self._device_activities(),
             schedule=torch.profiler.schedule(wait=0, warmup=1, active=4, repeat=2),
             on_trace_ready=handler,
         )
@@ -4098,6 +4102,9 @@ class TestProfilerDeviceStopped(TestCase):
 
         self.assertEqual(len(event_counts), 2)
         self.assertGreater(event_counts[1], 0, "Cycle 2 trace should contain events")
+
+
+instantiate_device_type_tests(TestProfilerDeviceStopped, globals(), except_for=("cpu",))
 
 
 @unittest.skipIf(not kineto_available(), "Kineto is required")
